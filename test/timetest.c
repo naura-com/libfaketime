@@ -407,12 +407,12 @@ printf("%s", 0 == 1 ? argv[0] : "");
     printf("time()         : Current date and time: %s", ctime(&now));
     printf("time(NULL)     : Seconds since Epoch  : %u\n", (unsigned int)time(NULL));
 
-#if defined(__GNUC__) && __GNUC__ >= 4
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
 #endif
     ftime(&tb);
-#if defined(__GNUC__) && __GNUC__ >= 4
+#if defined(__GNUC__) && (__GNUC__ > 4 || (__GNUC__ == 4 && __GNUC_MINOR__ >= 6))
 #pragma GCC diagnostic pop
 #endif
     printf("ftime()        : Current date and time: %s", ctime(&tb.time));
