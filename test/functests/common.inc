@@ -52,6 +52,31 @@ fakecmd()
 	${PLATFORM}_fakecmd "$@"
 }
 
+# Cross-platform file mtime setter.
+# Usage: set_file_mtime <file> <epoch> [<fractional_seconds>]
+#   epoch: Unix timestamp (integer seconds)
+#   fractional_seconds: optional, e.g. "005" for 5 milliseconds
+set_file_mtime()
+{
+	typeset file="$1"
+	typeset epoch="$2"
+	typeset frac="${3:-}"
+
+	if [ "$PLATFORM" = "mac" ]; then
+		if [ -n "$frac" ]; then
+			python3 -c "import os; t=$epoch.${frac}; os.utime('$file', (t, t))"
+		else
+			python3 -c "import os; os.utime('$file', ($epoch, $epoch))"
+		fi
+	else
+		if [ -n "$frac" ]; then
+			touch -d "@${epoch}.${frac}" "$file"
+		else
+			touch -d "@$epoch" "$file"
+		fi
+	fi
+}
+
 # generate a sequence of numbers from a to b
 range()
 {

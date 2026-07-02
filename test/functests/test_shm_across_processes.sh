@@ -19,6 +19,13 @@ run()
 {
 	init
 
+	# macOS SIP prevents DYLD_INSERT_LIBRARIES for system binaries (e.g., /bin/date),
+	# so this test cannot verify SHM-based time faking across processes on macOS.
+	if [ "$PLATFORM" = "mac" ]; then
+		echo "# (skipping, SIP blocks DYLD_INSERT_LIBRARIES for system binaries)"
+		return 0
+	fi
+
 	run_testcase shm_year_check
 }
 

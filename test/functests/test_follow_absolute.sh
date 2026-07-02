@@ -22,6 +22,14 @@ run()
 {
 	init
 
+	# macOS SIP prevents DYLD_INSERT_LIBRARIES from intercepting system
+	# binaries (date, perl). The follow_absolute tests rely on these to
+	# verify time faking behavior and cannot run reliably on macOS.
+	if [ "$PLATFORM" = "mac" ]; then
+		echo "# (skipping, SIP blocks DYLD_INSERT_LIBRARIES for system binaries)"
+		return 0
+	fi
+
 	run_testcase follow_absolute_basic
 	run_testcase follow_absolute_freeze
 	run_testcase follow_absolute_tracks_mtime
@@ -40,7 +48,7 @@ follow_absolute_cmd()
 # Test that time matches the follow file's mtime
 follow_absolute_basic()
 {
-	touch -d "2020-03-15 10:30:00 UTC" "$FOLLOW_FILE"
+	set_file_mtime "$FOLLOW_FILE" 1584268200
 	typeset actual
 	actual=$(follow_absolute_cmd date -u +"%Y-%m-%d %H:%M:%S")
 	asserteq "$actual" "2020-03-15 10:30:00" \
@@ -50,7 +58,7 @@ follow_absolute_basic()
 # Test that time stays frozen (does not advance with real time)
 follow_absolute_freeze()
 {
-	touch -d "2020-03-15 10:30:00 UTC" "$FOLLOW_FILE"
+	set_file_mtime "$FOLLOW_FILE" 1584268200
 	typeset timestamps
 	timestamps=$(follow_absolute_cmd \
 		perl -e 'print time(), "\n"; sleep(2); print time(), "\n"')
@@ -64,12 +72,12 @@ follow_absolute_freeze()
 # Test that time tracks file mtime changes at millisecond precision
 follow_absolute_tracks_mtime()
 {
-	touch -d "2020-03-15 10:30:00.000 UTC" "$FOLLOW_FILE"
+	set_file_mtime "$FOLLOW_FILE" 1584268200 000
 	typeset first
 	first=$(follow_absolute_cmd \
 		perl -MTime::HiRes=time -e 'printf "%.3f\n", time()')
 
-	touch -d "2020-03-15 10:30:00.005 UTC" "$FOLLOW_FILE"
+	set_file_mtime "$FOLLOW_FILE" 1584268200 005
 	typeset second
 	second=$(follow_absolute_cmd \
 		perl -MTime::HiRes=time -e 'printf "%.3f\n", time()')
