@@ -26,6 +26,13 @@
 #include <sys/time.h>
 #include <sys/timeb.h>
 
+#ifndef UTIME_NOW
+#define UTIME_NOW  ((1l << 30) - 2l)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1l << 30) - 1l)
+#endif
+
 #ifndef __APPLE__
 #ifdef FAKE_STAT
 #include <sys/types.h>
@@ -102,6 +109,7 @@ static void test_utime_now(void)
   printf("utime()/utimes(): NOW handling passed\n");
 }
 
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 6))
 static void test_utimens_now(void)
 {
   char path[] = "/tmp/libfaketime-utimensat-XXXXXX";
@@ -164,6 +172,7 @@ static void test_utimens_now(void)
 
   printf("utimensat()/futimens(): NOW handling passed\n");
 }
+#endif /* glibc >= 2.6 */
 
 static void
 handler(int sig, siginfo_t *si, void *uc)
@@ -228,7 +237,9 @@ void* pthread_test(void* args)
 
 
   pthread_condattr_init(&attr);
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 4))
   pthread_condattr_setclock(&attr, CLOCK_MONOTONIC);
+#endif
   pthread_cond_init(&monotonic_cond, &attr);
 
   clock_gettime(CLOCK_MONOTONIC, &now);
@@ -396,10 +407,14 @@ printf("%s", 0 == 1 ? argv[0] : "");
     printf("time()         : Current date and time: %s", ctime(&now));
     printf("time(NULL)     : Seconds since Epoch  : %u\n", (unsigned int)time(NULL));
 
+#if defined(__GNUC__) && __GNUC__ >= 4
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
     ftime(&tb);
+#if defined(__GNUC__) && __GNUC__ >= 4
 #pragma GCC diagnostic pop
+#endif
     printf("ftime()        : Current date and time: %s", ctime(&tb.time));
 
     printf("(Intentionally sleeping 2 seconds...)\n");
@@ -415,7 +430,9 @@ printf("%s", 0 == 1 ? argv[0] : "");
 
 #ifndef __APPLE__
     test_utime_now();
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 6))
     test_utimens_now();
+#endif
     if (sigprocmask(SIG_UNBLOCK, &mask, NULL) == -1)
     {
       perror("sigprocmask");

@@ -69,18 +69,26 @@ follow_absolute_freeze()
 		"time should stay frozen within a single process"
 }
 
-# Test that time tracks file mtime changes at millisecond precision
+# Test that time tracks file mtime changes at sub-second precision
 follow_absolute_tracks_mtime()
 {
+	# Check if filesystem supports sub-second mtime
+	touch "$FOLLOW_FILE"
+	perl -e 'utime 1234567890, 1234567890.500, shift' "$FOLLOW_FILE" 2>/dev/null
+	typeset mtime
+	mtime=$(perl -e 'my $m = (stat(shift))[9]; print $m' "$FOLLOW_FILE" 2>/dev/null)
+	if [ "$mtime" = "1234567890" ]; then
+		echo "# (skipping, sub-second mtime not supported on this filesystem)"
+		return 0
+	fi
+
 	set_file_mtime "$FOLLOW_FILE" 1584268200 000
 	typeset first
-	first=$(follow_absolute_cmd \
-		perl -MTime::HiRes=time -e 'printf "%.3f\n", time()')
+	first=$(follow_absolute_cmd date +%s.%N)
 
 	set_file_mtime "$FOLLOW_FILE" 1584268200 005
 	typeset second
-	second=$(follow_absolute_cmd \
-		perl -MTime::HiRes=time -e 'printf "%.3f\n", time()')
+	second=$(follow_absolute_cmd date +%s.%N)
 
 	assertneq "$first" "$second" \
 		"time should advance with file mtime (ms precision)"

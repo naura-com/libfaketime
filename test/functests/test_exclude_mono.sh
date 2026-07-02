@@ -64,13 +64,30 @@ get_monotonic_time()
 {
     dont_fake_mono=$1; shift;
     clock_id=$1; shift;
+    cat > /tmp/libfaketime_mono_helper.c << 'CEOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+int main() {
+    struct timespec ts1, ts2;
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    printf("%lld.%09ld\n", (long long)ts1.tv_sec, ts1.tv_nsec);
+    sleep(1);
+    clock_gettime(CLOCK_MONOTONIC, &ts2);
+    printf("%lld.%09ld\n", (long long)ts2.tv_sec, ts2.tv_nsec);
+    return 0;
+}
+CEOF
+    if [ "$PLATFORM" = "mac" ]; then
+        gcc -o /tmp/libfaketime_mono_helper /tmp/libfaketime_mono_helper.c
+    else
+        gcc -o /tmp/libfaketime_mono_helper /tmp/libfaketime_mono_helper.c -lrt
+    fi
     FAKETIME_DONT_FAKE_MONOTONIC=${dont_fake_mono} \
     fakecmd "2014-07-21 09:00:00" \
-    bash -c "for i in 1 2; do \
-    perl -w -MTime::HiRes=clock_gettime,${clock_id} -E \
-    'say clock_gettime(${clock_id})'; \
-    sleep 1; \
-    done"
+    /tmp/libfaketime_mono_helper
+    rm -f /tmp/libfaketime_mono_helper /tmp/libfaketime_mono_helper.c
 }
 
 dont_fake_mono()

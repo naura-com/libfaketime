@@ -66,8 +66,26 @@
 #error INTERCEPT_SYSCALL should only be defined on GNU/Linux systems.
 #endif
 #endif
-#ifdef __linux__
+#if defined(__linux__) && (!defined(__GLIBC__) || __GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 8))
 #include <sys/timerfd.h>
+#define HAVE_TIMERFD 1
+#endif
+
+#ifndef UTIME_NOW
+#define UTIME_NOW  ((1l << 30) - 2l)
+#endif
+#ifndef UTIME_OMIT
+#define UTIME_OMIT ((1l << 30) - 1l)
+#endif
+
+#ifndef O_CLOEXEC
+#define O_CLOEXEC  02000000
+#endif
+
+#if defined(__GLIBC__) && __GLIBC__ == 2 && __GLIBC_MINOR__ < 9
+#include <byteswap.h>
+#define be64toh(x) bswap_64(x)
+#define htobe64(x) bswap_64(x)
 #endif
 
 #include "uthash.h"
@@ -280,11 +298,13 @@ static int          (*real_timer_settime_233)  (timer_t timerid, int flags,
 static int          (*real_timer_gettime_233)  (timer_t timerid,
                                                 struct itimerspec *curr_value);
 #endif
+#ifdef HAVE_TIMERFD
 static int          (*real_timerfd_settime)    (int fd, int flags,
                                                 const struct itimerspec *new_value,
                                                 struct itimerspec *old_value);
 static int          (*real_timerfd_gettime)    (int fd,
                                                 struct itimerspec *curr_value);
+#endif
 #endif
 #endif
 #ifdef FAKE_SLEEP
@@ -2232,8 +2252,12 @@ timer_settime_common(timer_t_or_int timerid, int flags,
                     flags, new_real_pt, old_value));
        break;
     case FT_FD:
+#ifdef HAVE_TIMERFD
        DONT_FAKE_TIME(result = (*real_timerfd_settime)(timerid.int_member,
                     flags, new_real_pt, old_value));
+#else
+       result = -1;
+#endif
        break;
     default:
       result = -1;
@@ -2289,7 +2313,11 @@ int timer_gettime_common(timer_t_or_int timerid, struct itimerspec *curr_value, 
       DONT_FAKE_TIME(result = (*real_timer_gettime_233)(timerid.timer_t_member, curr_value));
       break;
     case FT_FD:
+#ifdef HAVE_TIMERFD
        DONT_FAKE_TIME(result = (*real_timerfd_gettime)(timerid.int_member, curr_value));
+#else
+       result = -1;
+#endif
        break;
     default:
       result = -1;
@@ -2436,7 +2464,7 @@ __asm__(".symver timer_settime_22, timer_settime@GLIBC_2.2");
 __asm__(".symver timer_settime_233, timer_settime@@GLIBC_2.3.3");
 #endif /* __ANDROID__ */
 
-#ifdef __linux__
+#ifdef HAVE_TIMERFD
 /*
  * Faked timerfd_settime
  */
@@ -2475,7 +2503,7 @@ int timerfd_gettime(int fd, struct itimerspec *curr_value)
     return (timer_gettime_common(temp, curr_value, FT_FD));
   }
 }
-#endif
+#endif /* HAVE_TIMERFD */
 
 #endif
 #endif
@@ -2851,7 +2879,11 @@ static void parse_ft_string(const char *user_faked_time)
       }
       else
       {
+#ifndef __APPLE__
+        DONT_FAKE_TIME(ret = real_xstat(_STAT_VER, getenv("FAKETIME_FOLLOW_FILE"), &master_file_stats));
+#else
         DONT_FAKE_TIME(ret = stat(getenv("FAKETIME_FOLLOW_FILE"), &master_file_stats));
+#endif
         if (ret == -1)
         {
           fprintf(stderr, "libfaketime: Cannot get timestamp of file %s as requested by %% operator.\n", getenv("FAKETIME_FOLLOW_FILE"));
@@ -3122,7 +3154,7 @@ static void ftpl_really_init(void)
   real_timer_gettime_233 =  dlsym(RTLD_NEXT, "timer_gettime");
 #endif
 #endif
-#ifdef __linux__
+#ifdef HAVE_TIMERFD
   real_timerfd_gettime =  dlsym(RTLD_NEXT, "timerfd_gettime");
   real_timerfd_settime =  dlsym(RTLD_NEXT, "timerfd_settime");
 #endif
@@ -3389,7 +3421,7 @@ static void init_initialized_once_mutex (void)
   ft_initialize_errorcheck_mutex(&initialized_once_mutex);
 }
 
-inline static void ftpl_init(void) {
+static void ftpl_init(void) {
   static bool init_done = false;
   ft_init_once_generic(&init_done, &initialized_once_control, &initialized_once_mutex, &init_initialized_once_mutex, &ftpl_really_init);
 }
@@ -4062,7 +4094,11 @@ int pthread_cond_init_232(pthread_cond_t *restrict cond, const pthread_condattr_
   if (result != 0 || attr == NULL)
     return result;
 
+#if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 4))
   pthread_condattr_getclock(attr, &clock_id);
+#else
+  clock_id = CLOCK_REALTIME;
+#endif
 
   if (clock_id == CLOCK_MONOTONIC) {
     struct pthread_cond_monotonic *e = (struct pthread_cond_monotonic*)malloc(sizeof(struct pthread_cond_monotonic));
