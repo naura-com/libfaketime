@@ -2868,7 +2868,11 @@ static void parse_ft_string(const char *user_faked_time)
           else
           {
             /* Set fake time to nanosecond-precision mtime */
+#ifndef __APPLE__
             user_faked_time_timespec.tv_nsec = master_file_stats.st_mtim.tv_nsec;
+#else
+            user_faked_time_timespec.tv_nsec = master_file_stats.st_mtimespec.tv_nsec;
+#endif
 
             /* Freeze fake time (mtime is absolute truth in this mode) */
             if (ft_mode != FT_NOOP)
