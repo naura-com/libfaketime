@@ -1549,8 +1549,19 @@ int futimens(int fd, const struct timespec times[2])
  */
 
 #ifdef FAKE_SLEEP
+
+/* Maximum real-time chunk size for chunked sleep (100ms).
+ * Breaking long sleeps into small chunks allows mid-sleep
+ * config changes (e.g., rate changes via FAKETIME_TIMESTAMP_FILE)
+ * to take effect without waiting for the full sleep to complete. */
+#define FAKE_SLEEP_CHUNK_NS 100000000LL
+
 /*
  * Faked nanosleep()
+ *
+ * When a rate is set, the sleep is broken into chunks of at most
+ * FAKE_SLEEP_CHUNK_NS real time. After each chunk, the config file
+ * is re-read so that rate changes take effect mid-sleep.
  */
 #ifdef MACOS_DYLD_INTERPOSE
 int macos_nanosleep(const struct timespec *req, struct timespec *rem)
@@ -1566,47 +1577,94 @@ int nanosleep(const struct timespec *req, struct timespec *rem)
   {
     return -1;
   }
-  if (req != NULL)
-  {
-    if (user_rate_set && !dont_fake)
-    {
-      timespecmul(req, 1.0 / user_rate, &real_req);
-    }
-    else
-    {
-      real_req = *req;
-    }
-  }
-  else
+  if (req == NULL)
   {
     return -1;
   }
 
-#ifdef MACOS_DYLD_INTERPOSE
-  DONT_FAKE_TIME(result = (*nanosleep)(&real_req, rem));
-#else
-  DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, rem));
-#endif
-  if (result == -1)
+  if (user_rate_set && !dont_fake)
   {
+    /* Chunked sleep: track remaining fake time and loop in small
+     * real-time chunks so mid-sleep rate changes are picked up. */
+    struct timespec remaining_fake = *req;
+
+    while (remaining_fake.tv_sec > 0 || remaining_fake.tv_nsec > 0)
+    {
+      /* Re-read config to pick up rate changes from timestamp file.
+       * Only call if FAKETIME_TIMESTAMP_FILE is set, to avoid unnecessary
+       * file operations and potential NULL env var issues. */
+      if (getenv("FAKETIME_TIMESTAMP_FILE") != NULL)
+      {
+        read_config_file();
+      }
+
+      double current_rate = user_rate_set ? user_rate : 1.0;
+
+      /* How much real time is needed to sleep the remaining fake time? */
+      timespecmul(&remaining_fake, 1.0 / current_rate, &real_req);
+
+      /* Cap at FAKE_SLEEP_CHUNK_NS so we re-check config frequently */
+      if (real_req.tv_sec > 0 || real_req.tv_nsec > FAKE_SLEEP_CHUNK_NS)
+      {
+        real_req.tv_sec = 0;
+        real_req.tv_nsec = FAKE_SLEEP_CHUNK_NS;
+      }
+
+      struct timespec rem_chunk;
+#ifdef MACOS_DYLD_INTERPOSE
+      DONT_FAKE_TIME(result = (*nanosleep)(&real_req, &rem_chunk));
+#else
+      DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, &rem_chunk));
+#endif
+
+      if (result == -1)
+      {
+        /* Interrupted by signal: calculate actual real time slept,
+         * convert to fake time, and return remaining to caller. */
+        struct timespec actual_real_slept;
+        timespecsub(&real_req, &rem_chunk, &actual_real_slept);
+        struct timespec fake_slept;
+        timespecmul(&actual_real_slept, current_rate, &fake_slept);
+        timespecsub(&remaining_fake, &fake_slept, &remaining_fake);
+        if (rem != NULL)
+        {
+          *rem = remaining_fake;
+        }
+        return -1;
+      }
+
+      /* Subtract fake time elapsed during this chunk */
+      struct timespec fake_chunk;
+      timespecmul(&real_req, current_rate, &fake_chunk);
+      timespecsub(&remaining_fake, &fake_chunk, &remaining_fake);
+    }
+
+    if (rem != NULL)
+    {
+      rem->tv_sec = 0;
+      rem->tv_nsec = 0;
+    }
+    return 0;
+  }
+  else
+  {
+    /* No rate set or dont_fake is set: pass through directly */
+    real_req = *req;
+#ifdef MACOS_DYLD_INTERPOSE
+    DONT_FAKE_TIME(result = (*nanosleep)(&real_req, rem));
+#else
+    DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, rem));
+#endif
     return result;
   }
-
-  /* fake returned parts */
-  if ((rem != NULL) && ((rem->tv_sec != 0) || (rem->tv_nsec != 0)))
-  {
-    if (user_rate_set && !dont_fake)
-    {
-      timespecmul(rem, user_rate, rem);
-    }
-  }
-  /* return the result to the caller */
-  return result;
 }
 
 #ifndef __APPLE__
 /*
  * Faked clock_nanosleep()
+ *
+ * When a rate is set, the sleep is broken into chunks so that
+ * mid-sleep rate changes (via FAKETIME_TIMESTAMP_FILE) take effect.
  */
 int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req, struct timespec *rem)
 {
@@ -1618,10 +1676,61 @@ int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req, s
   {
     return -1;
   }
-  if (req != NULL)
+  if (req == NULL)
   {
-    if (flags & TIMER_ABSTIME) /* sleep until absolute time */
+    return -1;
+  }
+
+  if (flags & TIMER_ABSTIME) /* sleep until absolute time */
+  {
+    if (user_rate_set && !dont_fake &&
+        ((clock_id == CLOCK_REALTIME) || (clock_id == CLOCK_MONOTONIC)))
     {
+      /* Chunked absolute sleep: re-check how close we are to the
+       * target after each small chunk, recomputing with current rate. */
+      struct timespec remaining_fake;
+      timespecsub(req, &user_faked_time_timespec, &remaining_fake);
+
+      while (remaining_fake.tv_sec > 0 ||
+             (remaining_fake.tv_sec == 0 && remaining_fake.tv_nsec > 0))
+      {
+        if (getenv("FAKETIME_TIMESTAMP_FILE") != NULL)
+        {
+          read_config_file();
+        }
+        double current_rate = user_rate_set ? user_rate : 1.0;
+
+        timespecmul(&remaining_fake, 1.0 / current_rate, &real_req);
+        if (real_req.tv_sec > 0 || real_req.tv_nsec > FAKE_SLEEP_CHUNK_NS)
+        {
+          real_req.tv_sec = 0;
+          real_req.tv_nsec = FAKE_SLEEP_CHUNK_NS;
+        }
+
+        DONT_FAKE_TIME(result = (*real_clock_nanosleep)(clock_id, 0, &real_req, NULL));
+        if (result == -1)
+        {
+          /* Signal interrupted: return remaining fake time */
+          if (rem != NULL)
+          {
+            timespecsub(req, &user_faked_time_timespec, rem);
+          }
+          return -1;
+        }
+
+        /* Recompute remaining after this chunk */
+        timespecsub(req, &user_faked_time_timespec, &remaining_fake);
+      }
+      if (rem != NULL)
+      {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+      }
+      return 0;
+    }
+    else
+    {
+      /* Non-faked absolute sleep: one-shot computation */
       struct timespec tdiff, timeadj;
       timespecsub(req, &user_faked_time_timespec, &timeadj);
       if (user_rate_set)
@@ -1645,47 +1754,78 @@ int clock_nanosleep(clockid_t clock_id, int flags, const struct timespec *req, s
           timespecadd(&ftpl_starttime.mon, &tdiff, &real_req);
         }
         else
-        { /* leave untouched if CLOCK_MONOTONIC but faking monotonic clock disabled */
-            real_req = *req;
+        {
+          real_req = *req;
         }
-      }
-      else /* presumably only CLOCK_PROCESS_CPUTIME_ID, leave untouched */
-      {
-       real_req = *req;
-      }
-    }
-    else /* sleep for a relative time interval */
-    {
-      if (user_rate_set && !dont_fake && ((clock_id == CLOCK_REALTIME) || (clock_id == CLOCK_MONOTONIC))) /* don't touch CLOCK_PROCESS_CPUTIME_ID */
-      {
-        timespecmul(req, 1.0 / user_rate, &real_req);
       }
       else
       {
         real_req = *req;
       }
-    }
-  }
-  else
-  {
-    return -1;
-  }
 
-  DONT_FAKE_TIME(result = (*real_clock_nanosleep)(clock_id, flags, &real_req, rem));
-  if (result == -1)
-  {
-    return result;
-  }
-  /* fake returned parts */
-  if ((rem != NULL) && ((rem->tv_sec != 0) || (rem->tv_nsec != 0)))
-  {
-    if (user_rate_set && !dont_fake)
-    {
-      timespecmul(rem, user_rate, rem);
+      DONT_FAKE_TIME(result = (*real_clock_nanosleep)(clock_id, flags, &real_req, rem));
+      return result;
     }
   }
-  /* return the result to the caller */
-  return result;
+  else /* sleep for a relative time interval */
+  {
+    if (user_rate_set && !dont_fake &&
+        ((clock_id == CLOCK_REALTIME) || (clock_id == CLOCK_MONOTONIC)))
+    {
+      /* Chunked relative sleep, same approach as nanosleep() */
+      struct timespec remaining_fake = *req;
+
+      while (remaining_fake.tv_sec > 0 || remaining_fake.tv_nsec > 0)
+      {
+        if (getenv("FAKETIME_TIMESTAMP_FILE") != NULL)
+        {
+          read_config_file();
+        }
+        double current_rate = user_rate_set ? user_rate : 1.0;
+
+        timespecmul(&remaining_fake, 1.0 / current_rate, &real_req);
+        if (real_req.tv_sec > 0 || real_req.tv_nsec > FAKE_SLEEP_CHUNK_NS)
+        {
+          real_req.tv_sec = 0;
+          real_req.tv_nsec = FAKE_SLEEP_CHUNK_NS;
+        }
+
+        struct timespec rem_chunk;
+        DONT_FAKE_TIME(result = (*real_clock_nanosleep)(clock_id, 0, &real_req, &rem_chunk));
+        if (result == -1)
+        {
+          struct timespec actual_real_slept;
+          timespecsub(&real_req, &rem_chunk, &actual_real_slept);
+          struct timespec fake_slept;
+          timespecmul(&actual_real_slept, current_rate, &fake_slept);
+          timespecsub(&remaining_fake, &fake_slept, &remaining_fake);
+          if (rem != NULL)
+          {
+            *rem = remaining_fake;
+          }
+          return -1;
+        }
+
+        struct timespec fake_chunk;
+        timespecmul(&real_req, current_rate, &fake_chunk);
+        timespecsub(&remaining_fake, &fake_chunk, &remaining_fake);
+      }
+
+      if (rem != NULL)
+      {
+        rem->tv_sec = 0;
+        rem->tv_nsec = 0;
+      }
+      return 0;
+    }
+    else
+    {
+      /* No rate set or non-faked clock: pass through directly */
+      real_req = *req;
+      DONT_FAKE_TIME(result = (*real_clock_nanosleep)(clock_id, flags, &real_req, rem));
+      return result;
+    }
+  }
 }
 #endif
 
@@ -1703,8 +1843,6 @@ int usleep(useconds_t usec)
   ftpl_init();
   if (user_rate_set && !dont_fake)
   {
-    struct timespec real_req;
-
     if (real_nanosleep == NULL)
     {
       /* fall back to usleep() */
@@ -1720,13 +1858,14 @@ int usleep(useconds_t usec)
       return result;
     }
 
-    real_req.tv_sec = usec / 1000000;
-    real_req.tv_nsec = (usec % 1000000) * 1000;
-    timespecmul(&real_req, 1.0 / user_rate, &real_req);
+    /* Call our intercepted nanosleep (with chunking) instead of real */
+    struct timespec fake_req;
+    fake_req.tv_sec = usec / 1000000;
+    fake_req.tv_nsec = (usec % 1000000) * 1000;
 #ifdef MACOS_DYLD_INTERPOSE
-    DONT_FAKE_TIME(result = (*nanosleep)(&real_req, NULL));
+    result = macos_nanosleep(&fake_req, NULL);
 #else
-    DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, NULL));
+    result = nanosleep(&fake_req, NULL);
 #endif
   }
   else
@@ -1770,24 +1909,21 @@ unsigned int sleep(unsigned int seconds)
     else
     {
       int result;
-      struct timespec real_req = {seconds, 0}, rem;
-      timespecmul(&real_req, 1.0 / user_rate, &real_req);
+      /* Call our intercepted nanosleep (which handles chunking)
+       * instead of the real nanosleep, so mid-sleep rate changes
+       * via FAKETIME_TIMESTAMP_FILE take effect. */
+      struct timespec fake_req = {seconds, 0}, rem;
 #ifdef MACOS_DYLD_INTERPOSE
-      DONT_FAKE_TIME(result = (*nanosleep)(&real_req, &rem));
+      result = macos_nanosleep(&fake_req, &rem);
 #else
-      DONT_FAKE_TIME(result = (*real_nanosleep)(&real_req, &rem));
+      result = nanosleep(&fake_req, &rem);
 #endif
       if (result == -1)
       {
         return 0;
       }
 
-      /* fake returned parts */
-      if ((rem.tv_sec != 0) || (rem.tv_nsec != 0))
-      {
-        timespecmul(&rem, user_rate, &rem);
-      }
-      /* return the result to the caller */
+      /* rem is already in fake time from our nanosleep */
       return rem.tv_sec;
     }
   }
@@ -4701,7 +4837,8 @@ long syscall(long number, ...) {
 
 #ifdef FAKE_SLEEP
 #ifdef __NR_clock_nanosleep
-  /* Intercept raw clock_nanosleep syscall */
+  /* Intercept raw clock_nanosleep syscall — delegate to clock_nanosleep()
+   * which handles rate scaling and chunked sleep. */
   if (number == __NR_clock_nanosleep && (getenv("FAKETIME") || getenv("FAKETIME_TIMESTAMP_FILE")))
   {
     clockid_t clk_id;
@@ -4715,66 +4852,7 @@ long syscall(long number, ...) {
     rem = va_arg(ap, struct timespec*);
     va_end(ap);
 
-    if (req == NULL)
-    {
-      /* Pass through invalid input to maintain behavior */
-      return real_syscall(number, clk_id, flags, req, rem);
-    }
-
-    struct timespec real_req;
-
-    if (flags & TIMER_ABSTIME)
-    {
-      /* Sleep until absolute fake time 'req': convert to corresponding real abstime */
-      struct timespec tdiff, timeadj;
-      /* time difference between target fake abstime and fake base */
-      timespecsub(req, &user_faked_time_timespec, &timeadj);
-      if (user_rate_set) {
-        timespecmul(&timeadj, 1.0 / user_rate, &tdiff);
-      } else {
-        tdiff = timeadj;
-      }
-
-      if (clk_id == CLOCK_REALTIME)
-      {
-        timespecadd(&ftpl_starttime.real, &tdiff, &real_req);
-      } else if (clk_id == CLOCK_MONOTONIC)
-      {
-        get_fake_monotonic_setting(&fake_monotonic_clock);
-        if (fake_monotonic_clock) {
-          timespecadd(&ftpl_starttime.mon, &tdiff, &real_req);
-        } else {
-          /* leave untouched if monotonic faking disabled */
-          real_req = *req;
-        }
-      } else {
-        /* other clocks: leave untouched */
-        real_req = *req;
-      }
-    } else
-    {
-      /* Relative sleep: scale by 1/rate for realtime/monotonic when faking */
-      if (user_rate_set && !dont_fake && ((clk_id == CLOCK_REALTIME) || (clk_id == CLOCK_MONOTONIC)))
-      {
-        timespecmul(req, 1.0 / user_rate, &real_req);
-      } else {
-        real_req = *req;
-      }
-    }
-
-    long rc = real_syscall(number, clk_id, flags, &real_req, rem);
-    if (rc != 0)
-    {
-      return rc;
-    }
-    if (rem != NULL && (rem->tv_sec != 0 || rem->tv_nsec != 0))
-    {
-      if (user_rate_set && !dont_fake)
-      {
-        timespecmul(rem, user_rate, rem);
-      }
-    }
-    return rc;
+    return clock_nanosleep(clk_id, flags, req, rem);
   }
 #endif /* __NR_clock_nanosleep */
 #endif /* FAKE_SLEEP */
